@@ -381,6 +381,36 @@ def format_alert(slots):
     return "\n".join(lines)
 
 
+def watching_text(config, current):
+    """'감시 중' 메시지 본문을 만든다(생존 신고와 빈자리 소멸 통보가 공유)."""
+    courts = ", ".join(f"{c}코트" for c in config["courts"])
+    period = (
+        f"{config['start_date']} ~ {config['end_date']}"
+        if config["start_date"] and config["end_date"] else "제한 없음"
+    )
+    status = (
+        f"현재 예약가능: {len(current)}건 (상세는 별도 알림)"
+        if current else "현재 예약가능한 자리: 없음"
+    )
+    return (
+        "🎾 감시 중입니다.\n"
+        f"{status}\n"
+        f"• 코트: {courts}\n"
+        f"• 기간: {period}"
+    )
+
+
+def send_watching(config, current):
+    """'감시 중' 메시지를 보내고, 생존 신고 타이머(last_heartbeat)를 갱신한다.
+
+    타이머를 갱신하므로, 방금 이 메시지를 보냈다면 곧이어 12시간 생존 신고가
+    중복으로 나가지 않는다.
+    """
+    tg_send(watching_text(config, current))
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    redis("SET", "last_heartbeat", str(now))
+
+
 def maybe_heartbeat(config, current):
     """빈자리가 없어도 주기적으로 '감시 중' 상태를 보내 봇 생존을 확인시킨다.
 
@@ -392,24 +422,7 @@ def maybe_heartbeat(config, current):
     last = int(last) if last else 0
     if now - last < HEARTBEAT_INTERVAL_SEC:
         return
-
-    courts = ", ".join(f"{c}코트" for c in config["courts"])
-    period = (
-        f"{config['start_date']} ~ {config['end_date']}"
-        if config["start_date"] and config["end_date"] else "제한 없음"
-    )
-    if current:
-        status = f"현재 예약가능: {len(current)}건 (상세는 별도 알림)"
-    else:
-        status = "현재 예약가능한 자리: 없음"
-
-    tg_send(
-        "🎾 감시 중입니다.\n"
-        f"{status}\n"
-        f"• 코트: {courts}\n"
-        f"• 기간: {period}"
-    )
-    redis("SET", "last_heartbeat", str(now))
+    send_watching(config, current)
 
 
 def is_expired(config):
@@ -463,11 +476,15 @@ def main():
     # 3-1) '마지막 확인 시각'을 남긴다(/상태 에서 봇 생존·최신성 확인용).
     redis("SET", "last_run", str(int(datetime.datetime.now(datetime.timezone.utc).timestamp())))
 
-    # 4) 직전 기록과 비교해 '새로 열린 자리'만 알림
+    # 4) 직전 기록과 비교
     notified = set(load_json("notified", []))
     new_slots = current - notified
     if new_slots:
+        # 4-a) 새로 열린 자리가 있으면 상세 알림
         tg_send(format_alert(new_slots))
+    elif notified and not current:
+        # 4-b) 있던 자리가 모두 사라져 다시 빈자리 없음 → '감시 중' 통보
+        send_watching(config, current)
 
     # 5) 지금 열려 있는 자리만 기록으로 남긴다.
     #    사라진 자리는 빠지므로, 나중에 다시 열리면 새 알림으로 잡힌다.
