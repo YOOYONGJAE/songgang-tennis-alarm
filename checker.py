@@ -367,15 +367,17 @@ def check_availability(config):
 
 
 def format_alert(slots):
-    base = datetime.date.today().strftime("%Y%m%d")
-    ordered = sorted(slots)
+    """새로 열린 자리들을 코트+날짜로 정리하고, 자리마다 맞는 예약 링크를 붙인다.
+
+    링크의 place 는 그 자리의 코트로, base_date 는 그 자리의 날짜로 맞춘다.
+    (예: 1코트 2026-07-22 → place=1, base_date=20260722)
+    """
     lines = ["🎾 새로 예약가능한 자리가 생겼어요!", ""]
-    for s in ordered:
+    for s in sorted(slots):
         court, date = s.split(":")
-        lines.append(f"• {court}코트 — {date}")
-    first_court = ordered[0].split(":")[0]
-    lines.append("")
-    lines.append("예약: " + RESERVE_PAGE.format(court=first_court, base=base))
+        base = date.replace("-", "")  # 2026-07-22 → 20260722
+        url = RESERVE_PAGE.format(court=court, base=base)
+        lines.append(f"• {court}코트 — {date}\n  예약: {url}")
     return "\n".join(lines)
 
 
