@@ -42,14 +42,9 @@ UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 CENTER = "DJSISEOL11"        # 센터 코드
 PART = "01"                  # 시설 코드
 RENT_TYPE = "1001"           # 행사구분(체육행사)
-# 회차(시간대) 상태 use_yn: Y=예약완료, E=마감, D=추첨접수, U=예약불가.
-# 이 넷 중 아무것도 아닌 빈 값이면 예약가능(=예약 링크가 걸리는 회차)이다.
-BOOKED_STATES = {"Y", "E", "D", "U"}
+STATE_AVAILABLE = "10"       # 예약가능 상태코드 (20 = 예약불가)
 
-# 조회 엔드포인트는 기준일부터 약 6주치만 유효하므로 스캔 상한을 둔다.
-MAX_WINDOW_DAYS = 42
-
-TIME_URL = "https://www.djsiseol.or.kr/res/rest/facilities/place_time_state_list"
+STATE_URL = "https://www.djsiseol.or.kr/res/rest/facilities/place_month_state_list"
 RESERVE_PAGE = (
     "https://www.djsiseol.or.kr/res/www/121?action=list"
     "&center=DJSISEOL11&part=01&place={court}&rent_type=1001&base_date={base}"
@@ -282,24 +277,19 @@ def process_commands(config):
 # ---------------------------------------------------------------------------
 # 코트 빈자리 조회
 # ---------------------------------------------------------------------------
-def fetch_slots(court, date_ymd):
-    """특정 코트·날짜의 회차 목록을 받아 '예약가능한 회차'만 돌려준다.
-
-    date_ymd 는 YYYYMMDD 형식. 반환은 (start_time, end_time) 튜플 리스트.
-    use_yn 이 예약완료/마감/추첨/불가(BOOKED_STATES) 중 아무것도 아니면 예약가능.
-    """
+def fetch_court(court, base_date):
+    """한 코트의 한 달치 상태를 받아 예약가능 날짜 목록(YYYY-MM-DD)만 돌려준다."""
     r = requests.post(
-        TIME_URL,
+        STATE_URL,
         headers={
             "X-Requested-With": "XMLHttpRequest",
             "Referer": "https://www.djsiseol.or.kr/res/www/121",
         },
         data={
             "company_code": CENTER,
-            "group_cd": "",
             "part_code": PART,
             "place_code": str(court),
-            "base_date": date_ymd,
+            "base_date": base_date,
             "rent_type": RENT_TYPE,
             "mem_no": "",
         },
@@ -307,70 +297,40 @@ def fetch_slots(court, date_ymd):
         timeout=20,
     )
     r.raise_for_status()
-    open_slots = []
-    for it in r.json():
-        # 유효하지 않은 회차(time_no<=0)는 건너뛴다.
-        try:
-            if int(it.get("time_no") or 0) <= 0:
-                continue
-        except (TypeError, ValueError):
-            continue
-        if (it.get("use_yn") or "").strip() in BOOKED_STATES:
-            continue
-        open_slots.append((it.get("start_time", ""), it.get("end_time", "")))
-    return open_slots
+    data = r.json()
+    return [row["date"] for row in data if row.get("state_cd") == STATE_AVAILABLE]
 
 
-def target_dates(config):
-    """감시할 날짜 목록(datetime.date)을 만든다.
-
-    오늘부터 시작하되 설정된 기간과 엔드포인트 6주 상한 안으로 자른다.
-    """
-    today = datetime.date.today()
-    start = today
-    if config["start_date"]:
-        start = max(start, datetime.date.fromisoformat(config["start_date"]))
-    end = today + datetime.timedelta(days=MAX_WINDOW_DAYS)
-    if config["end_date"]:
-        end = min(end, datetime.date.fromisoformat(config["end_date"]))
-
-    dates = []
-    d = start
-    while d <= end:
-        dates.append(d)
-        d += datetime.timedelta(days=1)
-    return dates
+def in_range(date_str, config):
+    if config["start_date"] and date_str < config["start_date"]:
+        return False
+    if config["end_date"] and date_str > config["end_date"]:
+        return False
+    return True
 
 
 def check_availability(config):
-    """감시 대상 날짜×코트를 훑어 현재 예약가능한 회차 집합을 만든다.
-
-    각 원소는 'court:YYYY-MM-DD:HH:MM~HH:MM' 문자열이다.
-    """
+    """감시 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
+    base = datetime.date.today().strftime("%Y%m%d")
     current = set()
-    for date in target_dates(config):
-        ymd = date.strftime("%Y%m%d")
-        iso = date.isoformat()
-        for court in config["courts"]:
-            try:
-                for start, end in fetch_slots(court, ymd):
-                    current.add(f"{court}:{iso}:{start}~{end}")
-            except Exception as ex:  # 한 번 실패해도 나머지는 계속 조회
-                tg_send(f"[경고] {court}코트 {iso} 조회 실패: {ex}")
+    for court in config["courts"]:
+        try:
+            for d in fetch_court(court, base):
+                if in_range(d, config):
+                    current.add(f"{court}:{d}")
+        except Exception as ex:  # 한 코트가 실패해도 나머지는 계속 조회
+            tg_send(f"[경고] {court}코트 조회 실패: {ex}")
     return current
 
 
 def format_alert(slots):
-    """새로 열린 회차들을 코트+날짜+시간으로 정리한 알림 문구를 만든다."""
+    base = datetime.date.today().strftime("%Y%m%d")
     ordered = sorted(slots)
     lines = ["🎾 새로 예약가능한 자리가 생겼어요!", ""]
     for s in ordered:
-        # 'court:YYYY-MM-DD:HH:MM~HH:MM' → 앞의 두 콜론만 기준으로 분리.
-        court, date, time_range = s.split(":", 2)
-        lines.append(f"• {court}코트 — {date} ({time_range})")
-    # 첫 자리 기준으로 해당 날짜 예약 페이지 링크를 붙인다.
-    first_court, first_date, _ = ordered[0].split(":", 2)
-    base = first_date.replace("-", "")
+        court, date = s.split(":")
+        lines.append(f"• {court}코트 — {date}")
+    first_court = ordered[0].split(":")[0]
     lines.append("")
     lines.append("예약: " + RESERVE_PAGE.format(court=first_court, base=base))
     return "\n".join(lines)
