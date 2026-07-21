@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+송강실내테니스장 코트 빈자리 감시 봇.
+
+GitHub Actions 로 5분마다 실행되어 아래 세 가지를 한 사이클에 처리한다.
+  1) 텔레그램으로 들어온 설정 명령(/기간, /코트, /on ...)을 읽어 반영한다.
+  2) 감시 대상 코트의 예약가능 날짜를 조회한다.
+  3) 직전 사이클 대비 '새로 열린 자리'만 텔레그램으로 알린다.
+
+사이클 간에 이어져야 하는 상태(설정 / 알림기록 / 텔레그램 offset)는
+Upstash Redis(REST) 에 저장한다. 실행이 끝나면 메모리는 사라지므로
+모든 지속 상태는 반드시 Upstash 에 넣고 뺀다.
+"""
+
+import os
+import re
+import json
+import difflib
+import datetime
+
+import requests
+import urllib3
+
+# 이 사이트는 인증서 체인이 불완전해(중간 인증서 누락) 검증을 끄고 접속한다.
+# 그래서 verify=False 로 요청하며, 그때 뜨는 경고 메시지를 여기서 눌러둔다.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# ---------------------------------------------------------------------------
+# 환경변수 (GitHub Secrets 로 주입)
+# ---------------------------------------------------------------------------
+TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]          # 알림 받고 명령 보낼 대상
+UPSTASH_URL = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
+UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
+
+
+# ---------------------------------------------------------------------------
+# 감시 대상 고정값 (송강실내테니스장)
+# ---------------------------------------------------------------------------
+CENTER = "DJSISEOL11"        # 센터 코드
+PART = "01"                  # 시설 코드
+RENT_TYPE = "1001"           # 행사구분(체육행사)
+STATE_AVAILABLE = "10"       # 예약가능 상태코드 (20 = 예약불가)
+
+STATE_URL = "https://www.djsiseol.or.kr/res/rest/facilities/place_month_state_list"
+RESERVE_PAGE = (
+    "https://www.djsiseol.or.kr/res/www/121?action=list"
+    "&center=DJSISEOL11&part=01&place={court}&rent_type=1001&base_date={base}"
+)
+
+# 설정이 아직 없을 때 쓰는 기본값. courts 는 place_code(=코트 번호).
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "courts": [1, 2, 3, 4],
+    "start_date": None,      # "YYYY-MM-DD" 또는 None(=기간 제한 없음)
+    "end_date": None,
+}
+
+# 사용자가 칠 만한 표기를 표준 명령으로 모으는 별칭 표.
+# 오타가 나도 difflib 근사 매칭으로 이 키들 중 가까운 것을 되묻는다.
+COMMAND_ALIASES = {
+    "기간": "period", "기한": "period", "period": "period",
+    "코트": "court", "court": "court",
+    "상태": "status", "현황": "status", "status": "status",
+    "on": "on", "켜기": "on", "시작": "on",
+    "off": "off", "끄기": "off", "정지": "off",
+    "start": "help", "help": "help", "도움말": "help", "도움": "help",
+}
+
+HELP_TEXT = (
+    "🎾 송강실내테니스장 빈자리 알림 봇\n\n"
+    "사용 가능한 명령\n"
+    "• /기간 20260801 20260831 — 감시할 날짜 기간 설정\n"
+    "• /코트 1,3 — 감시할 코트 선택(생략 시 1~4 전체)\n"
+    "• /상태 — 현재 설정 보기\n"
+    "• /on, /off — 알림 켜고 끄기\n\n"
+    "날짜는 20260801, 2026-08-01, 8월1일, 8/1 아무 형식이나 됩니다.\n"
+    "설정은 다음 조회 사이클(최대 5분 뒤)에 반영됩니다."
+)
+
+
+# ---------------------------------------------------------------------------
+# Upstash Redis (REST) 헬퍼
+#   POST 로 ["CMD", "arg", ...] 배열을 보내면 {"result": ...} 로 돌려준다.
+#   서버리스라 연결을 붙들 필요 없이 매 호출이 독립적인 HTTP 요청이다.
+# ---------------------------------------------------------------------------
+def redis(*cmd):
+    r = requests.post(
+        UPSTASH_URL,
+        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+        json=list(cmd),
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json().get("result")
+
+
+def load_json(key, default):
+    """Upstash 에 저장된 JSON 문자열을 파이썬 객체로 되살린다."""
+    raw = redis("GET", key)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def save_json(key, value):
+    redis("SET", key, json.dumps(value, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# 텔레그램 헬퍼
+# ---------------------------------------------------------------------------
+def tg_send(text):
+    requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": False},
+        timeout=15,
+    )
+
+
+def tg_get_updates(offset):
+    """offset 이후로 봇에게 온 메시지를 한꺼번에 받아온다(롱폴링 없이 즉시 반환)."""
+    r = requests.get(
+        f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+        params={"offset": offset, "timeout": 0},
+        timeout=20,
+    )
+    return r.json().get("result", [])
+
+
+# ---------------------------------------------------------------------------
+# 날짜 형식 정규화
+#   20260801 / 2026-08-01 / 2026.8.1 / 8월1일 / 8/1 을 모두 "YYYY-MM-DD" 로.
+#   연도가 없으면 default_year 를 붙인다.
+# ---------------------------------------------------------------------------
+def normalize_date(token, default_year):
+    token = token.strip()
+
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", token)
+    if m:
+        y, mo, d = m.groups()
+    else:
+        m = re.fullmatch(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", token)
+        if m:
+            y, mo, d = m.groups()
+        else:
+            m = (re.fullmatch(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?", token)
+                 or re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})", token))
+            if not m:
+                return None
+            mo, d = m.groups()
+            y = default_year
+
+    try:
+        return datetime.date(int(y), int(mo), int(d)).isoformat()
+    except ValueError:
+        return None
+
+
+def closest_command(raw):
+    """오타 난 명령과 가장 비슷한 표준 별칭을 하나 찾아 되묻기용으로 돌려준다."""
+    matches = difflib.get_close_matches(raw, list(COMMAND_ALIASES.keys()), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+# ---------------------------------------------------------------------------
+# 텔레그램 명령 처리
+# ---------------------------------------------------------------------------
+def status_text(config):
+    courts = ", ".join(f"{c}코트" for c in config["courts"])
+    period = (
+        f"{config['start_date']} ~ {config['end_date']}"
+        if config["start_date"] and config["end_date"] else "제한 없음"
+    )
+    onoff = "켜짐" if config["enabled"] else "꺼짐"
+    return f"현재 설정\n• 알림: {onoff}\n• 코트: {courts}\n• 기간: {period}"
+
+
+def handle_command(cmd, args, config):
+    """명령 하나를 config 에 반영한다. 설정이 바뀌면 True 를 돌려준다."""
+    year = datetime.date.today().year
+
+    if cmd == "help":
+        tg_send(HELP_TEXT)
+        return False
+
+    if cmd == "status":
+        tg_send(status_text(config))
+        return False
+
+    if cmd == "on":
+        config["enabled"] = True
+        tg_send("알림을 켰어요. 다음 조회부터 감시합니다.")
+        return True
+
+    if cmd == "off":
+        config["enabled"] = False
+        tg_send("알림을 껐어요.")
+        return True
+
+    if cmd == "period":
+        if len(args) < 2:
+            tg_send("사용법: /기간 20260801 20260831  (시작일 종료일)")
+            return False
+        s = normalize_date(args[0], year)
+        e = normalize_date(args[1], year)
+        if not s or not e:
+            tg_send("날짜를 못 읽었어요. 예: /기간 2026-08-01 2026-08-31")
+            return False
+        if s > e:
+            s, e = e, s
+        config["start_date"], config["end_date"] = s, e
+        tg_send(f"감시 기간을 {s} ~ {e} 로 설정했어요.")
+        return True
+
+    if cmd == "court":
+        nums = sorted({int(n) for n in re.findall(r"[1-4]", " ".join(args))})
+        if not nums:
+            tg_send("1~4 사이 코트 번호를 알려주세요. 예: /코트 1,2")
+            return False
+        config["courts"] = nums
+        tg_send("감시 코트를 " + ", ".join(f"{n}코트" for n in nums) + " 로 설정했어요.")
+        return True
+
+    return False
+
+
+def process_commands(config):
+    """밀린 텔레그램 명령을 순서대로 처리하고 offset 을 전진시킨다."""
+    offset = int(redis("GET", "tg_offset") or 0)
+    updates = tg_get_updates(offset)
+    changed = False
+
+    for up in updates:
+        offset = up["update_id"] + 1
+        msg = up.get("message") or up.get("edited_message")
+        if not msg:
+            continue
+        # 허가된 사용자(내 chat_id)만 명령을 받아들인다.
+        if str(msg.get("chat", {}).get("id")) != str(TG_CHAT_ID):
+            continue
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            continue
+
+        parts = text[1:].split()
+        raw_cmd = parts[0].lower()
+        # "/기간@봇이름" 형태로 올 수 있어 @ 뒤는 잘라낸다.
+        raw_cmd = raw_cmd.split("@", 1)[0]
+        args = parts[1:]
+
+        cmd = COMMAND_ALIASES.get(raw_cmd)
+        if cmd is None:
+            suggestion = closest_command(raw_cmd)
+            if suggestion:
+                tg_send(
+                    f"'/{raw_cmd}' 명령을 못 알아들었어요. 혹시 '/{suggestion}' 인가요?\n"
+                    "/도움말 로 전체 명령을 볼 수 있어요."
+                )
+            else:
+                tg_send("모르는 명령이에요. /도움말 로 사용법을 확인하세요.")
+            continue
+
+        changed = handle_command(cmd, args, config) or changed
+
+    redis("SET", "tg_offset", str(offset))
+    if changed:
+        save_json("config", config)
+    return config
+
+
+# ---------------------------------------------------------------------------
+# 코트 빈자리 조회
+# ---------------------------------------------------------------------------
+def fetch_court(court, base_date):
+    """한 코트의 한 달치 상태를 받아 예약가능 날짜 목록(YYYY-MM-DD)만 돌려준다."""
+    r = requests.post(
+        STATE_URL,
+        headers={
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.djsiseol.or.kr/res/www/121",
+        },
+        data={
+            "company_code": CENTER,
+            "part_code": PART,
+            "place_code": str(court),
+            "base_date": base_date,
+            "rent_type": RENT_TYPE,
+            "mem_no": "",
+        },
+        verify=False,
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return [row["date"] for row in data if row.get("state_cd") == STATE_AVAILABLE]
+
+
+def in_range(date_str, config):
+    if config["start_date"] and date_str < config["start_date"]:
+        return False
+    if config["end_date"] and date_str > config["end_date"]:
+        return False
+    return True
+
+
+def check_availability(config):
+    """감시 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
+    base = datetime.date.today().strftime("%Y%m%d")
+    current = set()
+    for court in config["courts"]:
+        try:
+            for d in fetch_court(court, base):
+                if in_range(d, config):
+                    current.add(f"{court}:{d}")
+        except Exception as ex:  # 한 코트가 실패해도 나머지는 계속 조회
+            tg_send(f"[경고] {court}코트 조회 실패: {ex}")
+    return current
+
+
+def format_alert(slots):
+    base = datetime.date.today().strftime("%Y%m%d")
+    ordered = sorted(slots)
+    lines = ["🎾 새로 예약가능한 자리가 생겼어요!", ""]
+    for s in ordered:
+        court, date = s.split(":")
+        lines.append(f"• {court}코트 — {date}")
+    first_court = ordered[0].split(":")[0]
+    lines.append("")
+    lines.append("예약: " + RESERVE_PAGE.format(court=first_court, base=base))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 메인 사이클
+# ---------------------------------------------------------------------------
+def main():
+    config = load_json("config", dict(DEFAULT_CONFIG))
+    for k, v in DEFAULT_CONFIG.items():  # 예전 설정에 빠진 키가 있으면 기본값으로 보정
+        config.setdefault(k, v)
+
+    # 1) 밀린 명령 먼저 반영 (예: 방금 /on 을 눌렀으면 이번 사이클부터 감시)
+    process_commands(config)
+
+    # 2) 알림이 꺼져 있으면 조회하지 않고 종료
+    if not config.get("enabled"):
+        return
+
+    # 3) 현재 빈자리 조회
+    current = check_availability(config)
+
+    # 4) 직전 기록과 비교해 '새로 열린 자리'만 알림
+    notified = set(load_json("notified", []))
+    new_slots = current - notified
+    if new_slots:
+        tg_send(format_alert(new_slots))
+
+    # 5) 지금 열려 있는 자리만 기록으로 남긴다.
+    #    사라진 자리는 빠지므로, 나중에 다시 열리면 새 알림으로 잡힌다.
+    save_json("notified", sorted(current))
+
+
+if __name__ == "__main__":
+    main()

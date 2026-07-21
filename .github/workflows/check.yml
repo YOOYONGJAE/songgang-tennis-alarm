@@ -1,0 +1,34 @@
+name: court-check
+
+on:
+  schedule:
+    # 5분마다 실행 (GitHub 부하에 따라 몇 분 지연될 수 있음)
+    - cron: "*/5 * * * *"
+  # Actions 탭에서 수동 실행도 가능하게
+  workflow_dispatch: {}
+
+# 이전 실행이 아직 안 끝났으면 중복 실행을 막는다(상태 꼬임 방지)
+concurrency:
+  group: court-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run checker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python checker.py
