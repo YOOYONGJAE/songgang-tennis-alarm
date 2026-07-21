@@ -1,10 +1,8 @@
 name: court-check
 
 on:
-  schedule:
-    # 5분마다 실행 (GitHub 부하에 따라 몇 분 지연될 수 있음)
-    - cron: "*/5 * * * *"
-  # Actions 탭에서 수동 실행도 가능하게
+  # 실행은 외부 트리거(cron-job.org)와 수동 실행으로만 구동한다.
+  # GitHub 자체 예약(schedule/cron)은 불규칙해 사용하지 않는다.
   workflow_dispatch: {}
 
 # 이전 실행이 아직 안 끝났으면 중복 실행을 막는다(상태 꼬임 방지)
