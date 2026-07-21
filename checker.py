@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-송강실내테니스장 코트 빈자리 감시 봇.
+코트 빈자리 확인 봇.
 
-GitHub Actions 로 5분마다 실행되어 아래 세 가지를 한 사이클에 처리한다.
+GitHub Actions 로 실행될 때마다 아래 세 가지를 한 사이클에 처리한다.
   1) 텔레그램으로 들어온 설정 명령(/기간, /코트, /on ...)을 읽어 반영한다.
-  2) 감시 대상 코트의 예약가능 날짜를 조회한다.
+  2) 확인 대상 코트의 예약가능 날짜를 조회한다.
   3) 직전 사이클 대비 '새로 열린 자리'만 텔레그램으로 알린다.
 
 사이클 간에 이어져야 하는 상태(설정 / 알림기록 / 텔레그램 offset)는
@@ -37,7 +37,7 @@ UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 
 
 # ---------------------------------------------------------------------------
-# 감시 대상 고정값 (송강실내테니스장)
+# 확인 대상 고정값 (다른 시설로 쓰려면 이 상수들만 바꾸면 된다)
 # ---------------------------------------------------------------------------
 CENTER = "DJSISEOL11"        # 센터 코드
 PART = "01"                  # 시설 코드
@@ -50,7 +50,7 @@ RESERVE_PAGE = (
     "&center=DJSISEOL11&part=01&place={court}&rent_type=1001&base_date={base}"
 )
 
-# 빈자리가 없어도 이 간격마다 '감시 중' 생존 신고를 한 번 보낸다(하루 약 2회).
+# 빈자리가 없어도 이 간격마다 '확인 중' 생존 신고를 한 번 보낸다(하루 약 2회).
 HEARTBEAT_INTERVAL_SEC = 12 * 3600
 
 # 설정이 아직 없을 때 쓰는 기본값. courts 는 place_code(=코트 번호).
@@ -73,14 +73,14 @@ COMMAND_ALIASES = {
 }
 
 HELP_TEXT = (
-    "🎾 송강실내테니스장 빈자리 알림 봇\n\n"
+    "🎾 코트 빈자리 알림 봇\n\n"
     "사용 가능한 명령\n"
-    "• /기간 20260801 20260831 — 감시할 날짜 기간 설정\n"
-    "• /코트 1,3 — 감시할 코트 선택(생략 시 1~4 전체)\n"
+    "• /기간 20260801 20260831 — 확인할 날짜 기간 설정\n"
+    "• /코트 1,3 — 확인할 코트 선택(생략 시 1~4 전체)\n"
     "• /상태 — 현재 상태 전반 보기\n"
     "• /on, /off — 알림 켜고 끄기\n\n"
     "날짜는 20260801, 2026-08-01, 8월1일, 8/1 아무 형식이나 됩니다.\n"
-    "설정은 다음 조회 사이클(최대 5분 뒤)에 반영됩니다."
+    "설정은 다음 조회 사이클(최대 10분 뒤)에 반영됩니다."
 )
 
 
@@ -216,8 +216,8 @@ def status_text(config):
     return (
         "📋 봇 상태\n"
         f"• 알림: {onoff}\n"
-        f"• 감시 코트: {courts}\n"
-        f"• 감시 기간: {period}\n"
+        f"• 확인 코트: {courts}\n"
+        f"• 확인 기간: {period}\n"
         f"• 현재 예약가능: {avail}\n"
         f"• 마지막 확인: {_fmt_ago(redis('GET', 'last_run'))}\n"
         "• 실행 주기: 약 10분 (외부 트리거)"
@@ -238,7 +238,7 @@ def handle_command(cmd, args, config):
 
     if cmd == "on":
         config["enabled"] = True
-        tg_send("알림을 켰어요. 다음 조회부터 감시합니다.")
+        tg_send("알림을 켰어요. 다음 조회부터 확인합니다.")
         return True
 
     if cmd == "off":
@@ -258,7 +258,7 @@ def handle_command(cmd, args, config):
         if s > e:
             s, e = e, s
         config["start_date"], config["end_date"] = s, e
-        tg_send(f"감시 기간을 {s} ~ {e} 로 설정했어요.")
+        tg_send(f"확인 기간을 {s} ~ {e} 로 설정했어요.")
         return True
 
     if cmd == "court":
@@ -267,7 +267,7 @@ def handle_command(cmd, args, config):
             tg_send("1~4 사이 코트 번호를 알려주세요. 예: /코트 1,2")
             return False
         config["courts"] = nums
-        tg_send("감시 코트를 " + ", ".join(f"{n}코트" for n in nums) + " 로 설정했어요.")
+        tg_send("확인 코트를 " + ", ".join(f"{n}코트" for n in nums) + " 로 설정했어요.")
         return True
 
     return False
@@ -353,7 +353,7 @@ def in_range(date_str, config):
 
 
 def check_availability(config):
-    """감시 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
+    """확인 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
     base = datetime.date.today().strftime("%Y%m%d")
     current = set()
     for court in config["courts"]:
@@ -382,7 +382,7 @@ def format_alert(slots):
 
 
 def watching_text(config, current):
-    """'감시 중' 메시지 본문을 만든다(생존 신고와 빈자리 소멸 통보가 공유)."""
+    """'확인 중' 메시지 본문을 만든다(생존 신고와 빈자리 소멸 통보가 공유)."""
     courts = ", ".join(f"{c}코트" for c in config["courts"])
     period = (
         f"{config['start_date']} ~ {config['end_date']}"
@@ -393,7 +393,7 @@ def watching_text(config, current):
         if current else "현재 예약가능한 자리: 없음"
     )
     return (
-        "🎾 감시 중입니다.\n"
+        "🎾 확인 중입니다.\n"
         f"{status}\n"
         f"• 코트: {courts}\n"
         f"• 기간: {period}"
@@ -401,7 +401,7 @@ def watching_text(config, current):
 
 
 def send_watching(config, current):
-    """'감시 중' 메시지를 보내고, 생존 신고 타이머(last_heartbeat)를 갱신한다.
+    """'확인 중' 메시지를 보내고, 생존 신고 타이머(last_heartbeat)를 갱신한다.
 
     타이머를 갱신하므로, 방금 이 메시지를 보냈다면 곧이어 12시간 생존 신고가
     중복으로 나가지 않는다.
@@ -412,7 +412,7 @@ def send_watching(config, current):
 
 
 def maybe_heartbeat(config, current):
-    """빈자리가 없어도 주기적으로 '감시 중' 상태를 보내 봇 생존을 확인시킨다.
+    """빈자리가 없어도 주기적으로 '확인 중' 상태를 보내 봇 생존을 확인시킨다.
 
     마지막 신고 시각을 Upstash 에 두고, HEARTBEAT_INTERVAL_SEC(12시간)이
     지났을 때만 한 번 보낸다. 첫 실행(last=0)에는 바로 한 번 나간다.
@@ -426,7 +426,7 @@ def maybe_heartbeat(config, current):
 
 
 def is_expired(config):
-    """감시 종료일이 오늘보다 과거면 True. 기간 제한이 없으면 만료 개념이 없다."""
+    """확인 종료일이 오늘보다 과거면 True. 기간 제한이 없으면 만료 개념이 없다."""
     end = config.get("end_date")
     if not end:
         return False
@@ -434,18 +434,18 @@ def is_expired(config):
 
 
 def notify_expiry_once(config):
-    """감시 기간이 끝났음을 한 번만 안내한다.
+    """확인 기간이 끝났음을 한 번만 안내한다.
 
-    이미 안내한 종료일은 Upstash 에 기록해, 같은 만료로 5분마다 반복 안내하지 않는다.
+    이미 안내한 종료일은 Upstash 에 기록해, 같은 만료로 매 사이클 반복 안내하지 않는다.
     사용자가 /기간 으로 새 기간을 잡으면 종료일이 달라져 다음 만료 때 다시 안내된다.
     """
     end = config.get("end_date")
     if redis("GET", "expiry_notified") == end:
         return
     tg_send(
-        "⏰ 감시 기간이 종료되었습니다.\n"
+        "⏰ 확인 기간이 종료되었습니다.\n"
         f"(설정된 기간: {config.get('start_date')} ~ {end})\n"
-        "새로 감시하려면 /기간 20260801 20260831 처럼 다시 설정해주세요."
+        "새로 확인하려면 /기간 20260801 20260831 처럼 다시 설정해주세요."
     )
     redis("SET", "expiry_notified", end)
 
@@ -458,14 +458,14 @@ def main():
     for k, v in DEFAULT_CONFIG.items():  # 예전 설정에 빠진 키가 있으면 기본값으로 보정
         config.setdefault(k, v)
 
-    # 1) 밀린 명령 먼저 반영 (예: 방금 /on 을 눌렀으면 이번 사이클부터 감시)
+    # 1) 밀린 명령 먼저 반영 (예: 방금 /on 을 눌렀으면 이번 사이클부터 확인)
     process_commands(config)
 
     # 2) 알림이 꺼져 있으면 조회하지 않고 종료
     if not config.get("enabled"):
         return
 
-    # 2-1) 감시 기간이 지났으면 1회 안내하고 이번 사이클은 감시 중단
+    # 2-1) 확인 기간이 지났으면 1회 안내하고 이번 사이클은 확인 중단
     if is_expired(config):
         notify_expiry_once(config)
         return
@@ -483,14 +483,14 @@ def main():
         # 4-a) 새로 열린 자리가 있으면 상세 알림
         tg_send(format_alert(new_slots))
     elif notified and not current:
-        # 4-b) 있던 자리가 모두 사라져 다시 빈자리 없음 → '감시 중' 통보
+        # 4-b) 있던 자리가 모두 사라져 다시 빈자리 없음 → '확인 중' 통보
         send_watching(config, current)
 
     # 5) 지금 열려 있는 자리만 기록으로 남긴다.
     #    사라진 자리는 빠지므로, 나중에 다시 열리면 새 알림으로 잡힌다.
     save_json("notified", sorted(current))
 
-    # 6) 빈자리가 없어도 하루 약 2회 '감시 중' 생존 신고를 보낸다.
+    # 6) 빈자리가 없어도 하루 약 2회 '확인 중' 생존 신고를 보낸다.
     maybe_heartbeat(config, current)
 
 
