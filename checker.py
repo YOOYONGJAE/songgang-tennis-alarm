@@ -50,6 +50,9 @@ RESERVE_PAGE = (
     "&center=DJSISEOL11&part=01&place={court}&rent_type=1001&base_date={base}"
 )
 
+# 빈자리가 없어도 이 간격마다 '감시 중' 생존 신고를 한 번 보낸다(하루 약 2회).
+HEARTBEAT_INTERVAL_SEC = 12 * 3600
+
 # 설정이 아직 없을 때 쓰는 기본값. courts 는 place_code(=코트 번호).
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -336,6 +339,37 @@ def format_alert(slots):
     return "\n".join(lines)
 
 
+def maybe_heartbeat(config, current):
+    """빈자리가 없어도 주기적으로 '감시 중' 상태를 보내 봇 생존을 확인시킨다.
+
+    마지막 신고 시각을 Upstash 에 두고, HEARTBEAT_INTERVAL_SEC(12시간)이
+    지났을 때만 한 번 보낸다. 첫 실행(last=0)에는 바로 한 번 나간다.
+    """
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    last = redis("GET", "last_heartbeat")
+    last = int(last) if last else 0
+    if now - last < HEARTBEAT_INTERVAL_SEC:
+        return
+
+    courts = ", ".join(f"{c}코트" for c in config["courts"])
+    period = (
+        f"{config['start_date']} ~ {config['end_date']}"
+        if config["start_date"] and config["end_date"] else "제한 없음"
+    )
+    if current:
+        status = f"현재 예약가능: {len(current)}건 (상세는 별도 알림)"
+    else:
+        status = "현재 예약가능한 자리: 없음"
+
+    tg_send(
+        "🎾 감시 중입니다.\n"
+        f"{status}\n"
+        f"• 코트: {courts}\n"
+        f"• 기간: {period}"
+    )
+    redis("SET", "last_heartbeat", str(now))
+
+
 # ---------------------------------------------------------------------------
 # 메인 사이클
 # ---------------------------------------------------------------------------
@@ -363,6 +397,9 @@ def main():
     # 5) 지금 열려 있는 자리만 기록으로 남긴다.
     #    사라진 자리는 빠지므로, 나중에 다시 열리면 새 알림으로 잡힌다.
     save_json("notified", sorted(current))
+
+    # 6) 빈자리가 없어도 하루 약 2회 '감시 중' 생존 신고를 보낸다.
+    maybe_heartbeat(config, current)
 
 
 if __name__ == "__main__":
