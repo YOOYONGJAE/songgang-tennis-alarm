@@ -77,7 +77,7 @@ HELP_TEXT = (
     "사용 가능한 명령\n"
     "• /기간 20260801 20260831 — 감시할 날짜 기간 설정\n"
     "• /코트 1,3 — 감시할 코트 선택(생략 시 1~4 전체)\n"
-    "• /상태 — 현재 설정 보기\n"
+    "• /상태 — 현재 상태 전반 보기\n"
     "• /on, /off — 알림 켜고 끄기\n\n"
     "날짜는 20260801, 2026-08-01, 8월1일, 8/1 아무 형식이나 됩니다.\n"
     "설정은 다음 조회 사이클(최대 5분 뒤)에 반영됩니다."
@@ -174,14 +174,54 @@ def closest_command(raw):
 # ---------------------------------------------------------------------------
 # 텔레그램 명령 처리
 # ---------------------------------------------------------------------------
+def _fmt_ago(epoch):
+    """epoch(UTC초)를 '__분 전 (MM/DD HH:MM)' 형태로. 시각은 KST(UTC+9)로 표기."""
+    if not epoch:
+        return "아직 없음"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    then = datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
+    mins = int((now - then).total_seconds() // 60)
+    when = (then + datetime.timedelta(hours=9)).strftime("%m/%d %H:%M")
+    if mins < 1:
+        ago = "방금"
+    elif mins < 60:
+        ago = f"{mins}분 전"
+    else:
+        ago = f"{mins // 60}시간 {mins % 60}분 전"
+    return f"{ago} ({when})"
+
+
 def status_text(config):
-    courts = ", ".join(f"{c}코트" for c in config["courts"])
-    period = (
-        f"{config['start_date']} ~ {config['end_date']}"
-        if config["start_date"] and config["end_date"] else "제한 없음"
-    )
+    """봇의 전반 상태(설정 + 현재 빈자리 + 마지막 확인 시각)를 한 메시지로 만든다."""
     onoff = "켜짐" if config["enabled"] else "꺼짐"
-    return f"현재 설정\n• 알림: {onoff}\n• 코트: {courts}\n• 기간: {period}"
+    courts = ", ".join(f"{c}코트" for c in config["courts"])
+
+    if config["start_date"] and config["end_date"]:
+        period = f"{config['start_date']} ~ {config['end_date']}"
+        if is_expired(config):
+            period += " (⚠️ 만료됨 · /기간 으로 재설정)"
+    else:
+        period = "제한 없음"
+
+    # 현재 예약가능 자리는 마지막 사이클이 Upstash 에 남긴 기록에서 읽는다(사이트 재조회 X).
+    slots = sorted(load_json("notified", []))
+    if slots:
+        lines = "\n".join(
+            f"    - {s.split(':', 1)[0]}코트 {s.split(':', 1)[1]}" for s in slots
+        )
+        avail = f"{len(slots)}건\n{lines}"
+    else:
+        avail = "없음"
+
+    return (
+        "📋 봇 상태\n"
+        f"• 알림: {onoff}\n"
+        f"• 감시 코트: {courts}\n"
+        f"• 감시 기간: {period}\n"
+        f"• 현재 예약가능: {avail}\n"
+        f"• 마지막 확인: {_fmt_ago(redis('GET', 'last_run'))}\n"
+        "• 실행 주기: 약 10분 (외부 트리거)"
+    )
 
 
 def handle_command(cmd, args, config):
@@ -417,6 +457,9 @@ def main():
 
     # 3) 현재 빈자리 조회
     current = check_availability(config)
+
+    # 3-1) '마지막 확인 시각'을 남긴다(/상태 에서 봇 생존·최신성 확인용).
+    redis("SET", "last_run", str(int(datetime.datetime.now(datetime.timezone.utc).timestamp())))
 
     # 4) 직전 기록과 비교해 '새로 열린 자리'만 알림
     notified = set(load_json("notified", []))
