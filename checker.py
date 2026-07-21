@@ -370,6 +370,31 @@ def maybe_heartbeat(config, current):
     redis("SET", "last_heartbeat", str(now))
 
 
+def is_expired(config):
+    """감시 종료일이 오늘보다 과거면 True. 기간 제한이 없으면 만료 개념이 없다."""
+    end = config.get("end_date")
+    if not end:
+        return False
+    return datetime.date.today().isoformat() > end
+
+
+def notify_expiry_once(config):
+    """감시 기간이 끝났음을 한 번만 안내한다.
+
+    이미 안내한 종료일은 Upstash 에 기록해, 같은 만료로 5분마다 반복 안내하지 않는다.
+    사용자가 /기간 으로 새 기간을 잡으면 종료일이 달라져 다음 만료 때 다시 안내된다.
+    """
+    end = config.get("end_date")
+    if redis("GET", "expiry_notified") == end:
+        return
+    tg_send(
+        "⏰ 감시 기간이 종료되었습니다.\n"
+        f"(설정된 기간: {config.get('start_date')} ~ {end})\n"
+        "새로 감시하려면 /기간 20260801 20260831 처럼 다시 설정해주세요."
+    )
+    redis("SET", "expiry_notified", end)
+
+
 # ---------------------------------------------------------------------------
 # 메인 사이클
 # ---------------------------------------------------------------------------
@@ -383,6 +408,11 @@ def main():
 
     # 2) 알림이 꺼져 있으면 조회하지 않고 종료
     if not config.get("enabled"):
+        return
+
+    # 2-1) 감시 기간이 지났으면 1회 안내하고 이번 사이클은 감시 중단
+    if is_expired(config):
+        notify_expiry_once(config)
         return
 
     # 3) 현재 빈자리 조회
