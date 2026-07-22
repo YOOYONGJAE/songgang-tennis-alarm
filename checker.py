@@ -105,6 +105,19 @@ HELP_TEXT = (
     "설정은 다음 조회 사이클(최대 10분 뒤)에 반영됩니다."
 )
 
+# 텔레그램 입력창에서 '/' 만 쳐도 뜨는 자동완성 메뉴(setMyCommands)에 올릴 목록.
+# 텔레그램은 명령 이름에 소문자 영문·숫자·밑줄만 허용해 한글 명령(/기간 등)은
+# 메뉴에 등록할 수 없다. 그래서 메뉴에는 COMMAND_ALIASES 에 이미 있는 영문 별칭을
+# 걸고 설명만 한글로 단다. 한글 명령은 그대로 입력하면 기존처럼 계속 동작한다.
+COMMAND_MENU = [
+    ("help", "명령 목록 보기"),
+    ("status", "현재 상태 전반 보기"),
+    ("on", "알림 켜기"),
+    ("off", "알림 끄기"),
+    ("period", "확인 기간 설정 (예: /period 20260801 20260831)"),
+    ("court", "확인 코트 선택 (예: /court 1,3)"),
+]
+
 
 # ---------------------------------------------------------------------------
 # Upstash Redis (REST) 헬퍼
@@ -156,6 +169,29 @@ def tg_get_updates(offset):
         timeout=20,
     )
     return r.json().get("result", [])
+
+
+def register_command_menu():
+    """텔레그램 '/' 자동완성 메뉴(setMyCommands)를 등록한다.
+
+    메뉴 내용이 바뀔 때만 실제로 API 를 부르도록, 등록한 메뉴 버전을 Upstash 에
+    남겨 매 사이클(10분마다) 불필요한 재등록을 피한다. 메뉴 등록 실패는 조회·알림
+    같은 본기능과 무관하므로 조용히 넘겨(다음 사이클에 다시 시도) 전체 실행을 막지 않는다.
+    """
+    version = json.dumps(COMMAND_MENU, ensure_ascii=False)
+    try:
+        if redis("GET", "command_menu") == version:
+            return
+        commands = [{"command": c, "description": d} for c, d in COMMAND_MENU]
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/setMyCommands",
+            json={"commands": commands},
+            timeout=15,
+        )
+        if r.ok and r.json().get("ok"):
+            redis("SET", "command_menu", version)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +610,9 @@ def main():
     config = load_json("config", dict(DEFAULT_CONFIG))
     for k, v in DEFAULT_CONFIG.items():  # 예전 설정에 빠진 키가 있으면 기본값으로 보정
         config.setdefault(k, v)
+
+    # 0) 텔레그램 '/' 자동완성 메뉴를 등록(내용이 바뀐 경우에만 실제 호출)
+    register_command_menu()
 
     # 1) 밀린 명령 먼저 반영 (예: 방금 /on 을 눌렀으면 이번 사이클부터 확인)
     process_commands(config)
