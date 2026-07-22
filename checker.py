@@ -5,7 +5,7 @@
 
 GitHub Actions 로 실행될 때마다 아래 세 가지를 한 사이클에 처리한다.
   1) 텔레그램으로 들어온 설정 명령(/기간, /코트, /on ...)을 읽어 반영한다.
-  2) 확인 대상 코트의 예약가능 날짜를 조회한다.
+  2) 예약가능 날짜를 찾고, 그 날짜에만 들어가 예약가능 시간(회차)까지 확인한다.
   3) 직전 사이클 대비 '새로 열린 자리'만 텔레그램으로 알린다.
 
 사이클 간에 이어져야 하는 상태(설정 / 알림기록 / 텔레그램 offset)는
@@ -59,9 +59,14 @@ UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 CENTER = "DJSISEOL11"        # 센터 코드
 PART = "01"                  # 시설 코드
 RENT_TYPE = "1001"           # 행사구분(체육행사)
-STATE_AVAILABLE = "10"       # 예약가능 상태코드 (20 = 예약불가)
+STATE_AVAILABLE = "10"       # (월 단위) 예약가능 날짜 상태코드 (20 = 예약불가)
+
+# (시간 단위) 회차 use_yn: Y=예약완료, E=마감, D=추첨, U=불가.
+# 이 넷 중 아무것도 아닌 빈 값이면 그 회차가 예약가능(체크박스 활성).
+BOOKED_STATES = {"Y", "E", "D", "U"}
 
 STATE_URL = "https://www.djsiseol.or.kr/res/rest/facilities/place_month_state_list"
+TIME_URL = "https://www.djsiseol.or.kr/res/rest/facilities/place_time_state_list"
 RESERVE_PAGE = (
     "https://www.djsiseol.or.kr/res/www/121?action=list"
     "&center=DJSISEOL11&part=01&place={court}&rent_type=1001&base_date={base}"
@@ -224,7 +229,8 @@ def status_text(config):
     slots = sorted(load_json("notified", []))
     if slots:
         lines = "\n".join(
-            f"    - {s.split(':', 1)[0]}코트 {s.split(':', 1)[1]}" for s in slots
+            f"    - {c}코트 {d} {t}"
+            for c, d, t in (s.split(":", 2) for s in slots)
         )
         avail = f"{len(slots)}건\n{lines}"
     else:
@@ -361,6 +367,50 @@ def fetch_court(court, base_date):
     return [row["date"] for row in data if row.get("state_cd") == STATE_AVAILABLE]
 
 
+def fetch_times(court, date_ymd):
+    """특정 코트·날짜의 회차를 조회해 '예약가능한 회차'의 (시작,끝) 시간만 돌려준다.
+
+    use_yn 이 예약완료/마감/추첨/불가(BOOKED_STATES) 중 아무것도 아니면 예약가능.
+    date_ymd 는 YYYYMMDD 형식.
+    """
+    r = COURT_SESSION.post(
+        TIME_URL,
+        headers={
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.djsiseol.or.kr/res/www/121",
+        },
+        data={
+            "company_code": CENTER,
+            "group_cd": "",
+            "part_code": PART,
+            "place_code": str(court),
+            "base_date": date_ymd,
+            "rent_type": RENT_TYPE,
+            "mem_no": "",
+        },
+        verify=False,
+        timeout=20,
+    )
+    r.raise_for_status()
+    open_times = []
+    for it in r.json():
+        # 유효하지 않은 회차(time_no<=0)는 건너뛴다.
+        try:
+            if int(it.get("time_no") or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if (it.get("use_yn") or "").strip() in BOOKED_STATES:
+            continue
+        open_times.append((it.get("start_time", ""), it.get("end_time", "")))
+    return open_times
+
+
+def _polite_pause():
+    """사람이 버튼 누르듯, 다음 요청 전에 무작위로 잠깐 쉰다."""
+    time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
+
+
 def in_range(date_str, config):
     if config["start_date"] and date_str < config["start_date"]:
         return False
@@ -386,39 +436,66 @@ def _fail_reason(ex):
 
 
 def check_availability(config):
-    """확인 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
+    """2단계로 조회해 현재 예약가능한 회차 집합을 만든다.
+
+    1) 월 단위로 '예약가능(state_cd=10)' 날짜만 추린다(코트당 1요청).
+    2) 그 날짜에만 시간 단위로 들어가 실제 예약가능한 회차를 확인한다.
+    모든 외부 요청 사이에는 사람처럼 잠깐 쉬어 거부 확률을 낮춘다.
+    각 원소는 'court:YYYY-MM-DD:HH:MM~HH:MM' 문자열이다.
+    """
     base = datetime.date.today().strftime("%Y%m%d")
     current = set()
-    for i, court in enumerate(config["courts"]):
-        # 사람이 버튼 누르듯, 두 번째 코트부터는 요청 전에 잠깐 쉰다.
-        if i > 0:
-            time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
+    first = True
+    for court in config["courts"]:
+        # 1) 월 단위: 이 코트의 예약가능 날짜만 추린다.
+        if not first:
+            _polite_pause()
+        first = False
         try:
-            for d in fetch_court(court, base):
-                if in_range(d, config):
-                    current.add(f"{court}:{d}")
-        except Exception as ex:  # 한 코트가 실패해도 나머지는 계속 조회
+            dates = [d for d in fetch_court(court, base) if in_range(d, config)]
+        except Exception as ex:  # 한 코트가 실패해도 나머지는 계속
             tg_send(
-                f"⚠️ {court}코트 조회를 잠시 건너뛰었어요.\n"
+                f"⚠️ {court}코트 날짜 조회를 잠시 건너뛰었어요.\n"
                 f"· 원인: {_fail_reason(ex)}\n"
                 "· 다음 확인 때 다시 시도합니다."
             )
+            continue
+
+        # 2) 시간 단위: 예약가능 날짜에만 들어가 실제 열린 회차를 확인한다.
+        for d in dates:
+            _polite_pause()
+            try:
+                for start, end in fetch_times(court, d.replace("-", "")):
+                    current.add(f"{court}:{d}:{start}~{end}")
+            except Exception as ex:
+                tg_send(
+                    f"⚠️ {court}코트 {d} 시간 조회를 잠시 건너뛰었어요.\n"
+                    f"· 원인: {_fail_reason(ex)}\n"
+                    "· 다음 확인 때 다시 시도합니다."
+                )
     return current
 
 
 def format_alert(slots):
-    """새로 열린 자리들을 코트+날짜로 정리하고, 자리마다 맞는 예약 링크를 붙인다.
+    """새로 열린 회차들을 코트+날짜로 묶고, 그 날짜의 시간 목록과 예약 링크를 붙인다.
 
-    링크의 place 는 그 자리의 코트로, base_date 는 그 자리의 날짜로 맞춘다.
-    (예: 1코트 2026-07-22 → place=1, base_date=20260722)
+    slots 원소는 'court:YYYY-MM-DD:HH:MM~HH:MM'. 같은 코트·날짜의 시간은 한데 모은다.
+    링크의 place 는 그 코트로, base_date 는 그 날짜로 맞춘다.
     """
-    lines = ["🎾 새로 예약가능한 자리가 생겼어요!", ""]
+    by_cd = {}
     for s in sorted(slots):
-        court, date = s.split(":")
-        base = date.replace("-", "")  # 2026-07-22 → 20260722
+        court, date, tr = s.split(":", 2)
+        by_cd.setdefault((court, date), []).append(tr)
+
+    lines = ["🎾 새로 예약가능한 자리가 생겼어요!", ""]
+    for (court, date), times in by_cd.items():
+        base = date.replace("-", "")  # 2026-07-23 → 20260723
         url = RESERVE_PAGE.format(court=court, base=base)
-        lines.append(f"• {court}코트 — {date}\n  예약: {url}")
-    return "\n".join(lines)
+        lines.append(f"• {court}코트 — {date}")
+        lines.append(f"  시간: {', '.join(times)}")
+        lines.append(f"  예약: {url}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def watching_text(config, current):
