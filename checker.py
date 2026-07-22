@@ -369,6 +369,22 @@ def in_range(date_str, config):
     return True
 
 
+def _fail_reason(ex):
+    """조회 예외를 사용자용 원인 문구로 분류한다.
+
+    재시도 세션을 쓰면 타임아웃/거부 모두 ConnectionError 로 감싸져 오므로,
+    타입보다 메시지 문자열로 원인을 가려낸다.
+    """
+    text = str(ex).lower()
+    if "timed out" in text or "timeout" in text:
+        return "사이트 응답 지연 (제때 응답이 없었어요)"
+    if "refused" in text:
+        return "사이트가 접속을 거부 (요청이 몰렸을 수 있어요)"
+    if "newconnectionerror" in text or "failed to establish" in text:
+        return "사이트 접속 실패 (네트워크/서버 문제)"
+    return f"기타 오류 ({type(ex).__name__})"
+
+
 def check_availability(config):
     """확인 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
     base = datetime.date.today().strftime("%Y%m%d")
@@ -381,10 +397,11 @@ def check_availability(config):
             for d in fetch_court(court, base):
                 if in_range(d, config):
                     current.add(f"{court}:{d}")
-        except Exception:  # 한 코트가 실패해도 나머지는 계속 조회
+        except Exception as ex:  # 한 코트가 실패해도 나머지는 계속 조회
             tg_send(
-                f"⚠️ {court}코트 조회를 잠시 건너뛰었어요 "
-                "(사이트 응답 지연). 다음 확인 때 다시 시도합니다."
+                f"⚠️ {court}코트 조회를 잠시 건너뛰었어요.\n"
+                f"· 원인: {_fail_reason(ex)}\n"
+                "· 다음 확인 때 다시 시도합니다."
             )
     return current
 
