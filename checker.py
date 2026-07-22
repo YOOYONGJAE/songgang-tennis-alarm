@@ -16,15 +16,32 @@ Upstash Redis(REST) 에 저장한다. 실행이 끝나면 메모리는 사라지
 import os
 import re
 import json
+import time
+import random
 import difflib
 import datetime
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 이 사이트는 인증서 체인이 불완전해(중간 인증서 누락) 검증을 끄고 접속한다.
 # 그래서 verify=False 로 요청하며, 그때 뜨는 경고 메시지를 여기서 눌러둔다.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 사이트가 순간적으로 느리거나 응답을 안 할 때(타임아웃/일시적 끊김)를 대비해
+# 짧게 몇 번 재시도하는 세션. 대부분의 일시적 오류는 재시도에서 자동 회복된다.
+_court_retry = Retry(
+    total=3, connect=2, read=2, backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+COURT_SESSION = requests.Session()
+COURT_SESSION.mount("https://", HTTPAdapter(max_retries=_court_retry))
+
+# 사람이 버튼 누르듯, 코트 조회 요청 사이에 두는 간격(초 범위). 연속 요청이 튀지 않게 한다.
+REQUEST_MIN_DELAY = 2.0
+REQUEST_MAX_DELAY = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +339,7 @@ def process_commands(config):
 # ---------------------------------------------------------------------------
 def fetch_court(court, base_date):
     """한 코트의 한 달치 상태를 받아 예약가능 날짜 목록(YYYY-MM-DD)만 돌려준다."""
-    r = requests.post(
+    r = COURT_SESSION.post(
         STATE_URL,
         headers={
             "X-Requested-With": "XMLHttpRequest",
@@ -356,13 +373,19 @@ def check_availability(config):
     """확인 대상 코트를 모두 조회해 현재 예약가능한 'court:date' 집합을 만든다."""
     base = datetime.date.today().strftime("%Y%m%d")
     current = set()
-    for court in config["courts"]:
+    for i, court in enumerate(config["courts"]):
+        # 사람이 버튼 누르듯, 두 번째 코트부터는 요청 전에 잠깐 쉰다.
+        if i > 0:
+            time.sleep(random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY))
         try:
             for d in fetch_court(court, base):
                 if in_range(d, config):
                     current.add(f"{court}:{d}")
-        except Exception as ex:  # 한 코트가 실패해도 나머지는 계속 조회
-            tg_send(f"[경고] {court}코트 조회 실패: {ex}")
+        except Exception:  # 한 코트가 실패해도 나머지는 계속 조회
+            tg_send(
+                f"⚠️ {court}코트 조회를 잠시 건너뛰었어요 "
+                "(사이트 응답 지연). 다음 확인 때 다시 시도합니다."
+            )
     return current
 
 
